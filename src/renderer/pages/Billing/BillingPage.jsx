@@ -1,0 +1,968 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Search, Trash2, Plus, Minus, Printer } from 'lucide-react';
+import AppShell from '../../components/layout/AppShell';
+import { Button } from '../../components/ui/button';
+import { Alert, AlertDescription } from '../../components/ui/alert';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../../components/ui/dialog';
+import { invokeWithAuth, notifyLowStockUpdated } from '../../lib/ipc';
+import { useCartStore } from '../../store/cartStore';
+import { useAuthStore } from '../../store/authStore';
+import { cn } from '../../lib/utils';
+import { buildThermalReceiptHtml } from '../../lib/receiptHtml';
+import { isStaleOpenSession } from '../../lib/colomboTime.js';
+
+const inputClassName =
+  'w-full p-3.5 rounded-xl bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring transition-all duration-100 font-semibold';
+
+function formatMoney(value) {
+  return `Rs. ${Number(value || 0).toFixed(2)}`;
+}
+
+function maxDiscountPctForRole(role, settings) {
+  if (role === 'admin') return null;
+  if (role === 'manager') return Number(settings?.managerMaxDiscountPct ?? 25);
+  return Number(settings?.cashierMaxDiscountPct ?? 10);
+}
+
+function discountExceedsLimit(base, discountAmount, maxPct) {
+  if (maxPct === null || maxPct === undefined) return false;
+  if (base <= 0) return discountAmount > 0;
+  return (discountAmount / base) * 100 > maxPct + 0.001;
+}
+
+export default function BillingPage() {
+  const navigate = useNavigate();
+  const user = useAuthStore((state) => state.user);
+  const barcodeRef = useRef(null);
+  const [barcode, setBarcode] = useState('');
+  const [catalog, setCatalog] = useState([]);
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogQuery, setCatalogQuery] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('cash');
+  const [tendered, setTendered] = useState('');
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [settings, setSettings] = useState(null);
+  const [successOpen, setSuccessOpen] = useState(false);
+  const [printStatus, setPrintStatus] = useState('');
+  const [printing, setPrinting] = useState(false);
+  const [completedSale, setCompletedSale] = useState(null);
+  const [receiptSeconds, setReceiptSeconds] = useState(120);
+  const [saleDiscDraftType, setSaleDiscDraftType] = useState('fixed');
+  const [saleDiscDraftValue, setSaleDiscDraftValue] = useState('');
+  const [dayOpen, setDayOpen] = useState(null);
+
+  const items = useCartStore((state) => state.items);
+  const saleDiscountType = useCartStore((state) => state.saleDiscountType);
+  const saleDiscountValue = useCartStore((state) => state.saleDiscountValue);
+  const addItem = useCartStore((state) => state.addItem);
+  const removeItem = useCartStore((state) => state.removeItem);
+  const updateQty = useCartStore((state) => state.updateQty);
+  const applyItemDiscount = useCartStore((state) => state.applyItemDiscount);
+  const applySaleDiscount = useCartStore((state) => state.applySaleDiscount);
+  const clearSaleDiscount = useCartStore((state) => state.clearSaleDiscount);
+  const clear = useCartStore((state) => state.clear);
+  const getTotals = useCartStore((state) => state.getTotals);
+  const setLastSale = useCartStore((state) => state.setLastSale);
+
+  const totals = useMemo(() => getTotals(), [items, saleDiscountType, saleDiscountValue, getTotals]);
+  const maxPct = maxDiscountPctForRole(user?.role, settings);
+  const staleDay = isStaleOpenSession(dayOpen);
+  const staleDayBlocks = staleDay && (settings?.staleDayPolicy || 'block') !== 'warn';
+  const change = useMemo(() => {
+    if (paymentMethod !== 'cash') return 0;
+    return Math.max(0, Number(tendered || 0) - totals.total);
+  }, [paymentMethod, tendered, totals.total]);
+
+  useEffect(() => {
+    barcodeRef.current?.focus();
+    Promise.all([
+      invokeWithAuth('settings:get'),
+      invokeWithAuth('product:getAll'),
+      invokeWithAuth('cashSession:getOpen'),
+    ]).then(([settingsResponse, productsResponse, sessionResponse]) => {
+      if (settingsResponse.success) setSettings(settingsResponse.data);
+      if (productsResponse.success) setCatalog(productsResponse.data || []);
+      if (sessionResponse.success) setDayOpen(sessionResponse.data);
+    });
+  }, []);
+
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key === 'F1') {
+        event.preventDefault();
+        barcodeRef.current?.focus();
+      }
+      if (event.key === 'Escape') {
+        setError('');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const handleLookup = async (event) => {
+    event?.preventDefault();
+    const code = barcode.trim();
+    if (!code) return;
+
+    setError('');
+    const response = await invokeWithAuth('product:lookupBarcode', { barcode: code });
+    if (!response.success) {
+      setError(response.error || 'Lookup failed.');
+      return;
+    }
+    if (!response.data) {
+      setError('No product found with this barcode.');
+      setBarcode('');
+      return;
+    }
+
+    const variant = response.data;
+    if (!(Number(variant.sellingPrice) > 0)) {
+      setError('This variant has no selling price. Set a price in Products before selling.');
+      return;
+    }
+    addItem({
+      id: variant.id,
+      variantId: variant.id,
+      productId: variant.productId || variant.product?.id,
+      productName: variant.product?.name,
+      variantName: variant.name,
+      sku: variant.sku,
+      barcode: variant.barcode,
+      sellingPrice: variant.sellingPrice,
+      costPrice: variant.costPrice,
+      taxRate: variant.product?.taxRate ?? 0,
+    });
+    setBarcode('');
+    barcodeRef.current?.focus();
+  };
+
+  const addVariantToSale = (variant) => {
+    if (!variant?.barcode) {
+      setError('Only barcode-enabled variants can be added to a sale.');
+      return;
+    }
+    if (!(Number(variant.sellingPrice) > 0)) {
+      setError('This variant has no selling price. Set a price in Products before selling.');
+      return;
+    }
+
+    addItem({
+      id: variant.id,
+      variantId: variant.id,
+      productId: variant.productId || variant.product?.id,
+      productName: variant.product?.name || variant.productName || variant.name,
+      variantName: variant.name,
+      sku: variant.sku,
+      barcode: variant.barcode,
+      sellingPrice: variant.sellingPrice,
+      costPrice: variant.costPrice,
+      taxRate: variant.product?.taxRate ?? 0,
+    });
+    setCatalogOpen(false);
+    setCatalogQuery('');
+    barcodeRef.current?.focus();
+  };
+
+  const catalogResults = useMemo(() => {
+    const query = catalogQuery.trim().toLowerCase();
+    const products = catalog || [];
+
+    const variants = products.flatMap((product) =>
+      (product.variants || [])
+        .filter((variant) => variant.barcode)
+        .map((variant) => ({
+          ...variant,
+          product,
+        }))
+    );
+
+    if (!query) {
+      return variants.slice(0, 50);
+    }
+
+    return variants.filter((variant) => {
+      const haystack = [
+        variant.product?.name,
+        variant.product?.brand,
+        variant.product?.category?.name,
+        variant.product?.category?.path,
+        variant.name,
+        variant.sku,
+        variant.barcode,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+
+      return haystack.includes(query);
+    });
+  }, [catalog, catalogQuery]);
+
+  const validateDiscounts = () => {
+    if (totals.saleDiscountAmount > 0 && discountExceedsLimit(totals.subtotal, totals.saleDiscountAmount, maxPct)) {
+      setError(`Sale discount exceeds your limit of ${maxPct}%.`);
+      return false;
+    }
+
+    for (const line of totals.lines) {
+      if (line.discountAmount > 0 && totals.saleDiscountType === 'none') {
+        if (discountExceedsLimit(line.gross || line.originalLineTotal, line.discountAmount, maxPct)) {
+          setError(`Discount on "${line.productName}" exceeds your limit of ${maxPct}%.`);
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  const handleItemDiscountChange = (variantId, type, value) => {
+    setError('');
+    if (type === 'none' || value === '' || Number(value) <= 0) {
+      applyItemDiscount(variantId, 'none', 0);
+      return;
+    }
+    applyItemDiscount(variantId, type, value);
+  };
+
+  const handleApplySaleDiscount = () => {
+    setError('');
+    const value = Number(saleDiscDraftValue);
+    if (!Number.isFinite(value) || value <= 0) {
+      clearSaleDiscount();
+      setSaleDiscDraftValue('');
+      return;
+    }
+    applySaleDiscount(saleDiscDraftType, value);
+  };
+
+  const handleClearSaleDiscount = () => {
+    clearSaleDiscount();
+    setSaleDiscDraftValue('');
+  };
+
+  const handleCompleteSale = async () => {
+    setError('');
+    if (!items.length) {
+      setError('Cart is empty.');
+      return;
+    }
+    if (staleDayBlocks) {
+      setError("Yesterday's cash day is still open. Close & print Z, then open today before continuing.");
+      return;
+    }
+    if (!validateDiscounts()) return;
+    if (paymentMethod === 'cash' && Number(tendered || 0) + 0.001 < totals.total) {
+      setError('Tendered amount is less than the total.');
+      return;
+    }
+
+    setSaving(true);
+    const response = await invokeWithAuth('sale:create', {
+      cartItems: items.map((item) => ({
+        variantId: item.variantId,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        discountType: item.discountType,
+        discountValue: item.discountValue,
+        taxRate: item.taxRate,
+      })),
+      saleDiscount: {
+        type: saleDiscountType,
+        value: saleDiscountValue,
+      },
+      payment: {
+        method: paymentMethod,
+        amountTendered: paymentMethod === 'cash' ? Number(tendered || 0) : totals.total,
+      },
+    });
+    setSaving(false);
+
+    if (!response.success) {
+      setError(response.error || 'Failed to complete sale.');
+      return;
+    }
+
+    setCompletedSale(response.data);
+    setReceiptSeconds(120);
+    setLastSale(response.data);
+    notifyLowStockUpdated();
+    clear();
+    setTendered('');
+    setPaymentMethod('cash');
+    setSaleDiscDraftValue('');
+    setSaleDiscDraftType('fixed');
+    setPrintStatus('Printing…');
+    setSuccessOpen(true);
+    setPrinting(true);
+
+    
+    // Auto-print + cash drawer (cash sales)
+    try {
+      const printRes = await invokeWithAuth('printer:printReceipt', {
+        saleId: response.data.id,
+        openDrawer: response.data.paymentMethod === 'cash',
+      });
+
+      if (printRes.success && printRes.data?.success) {
+        setPrintStatus(
+          response.data.paymentMethod === 'cash'
+            ? 'Receipt printed. Cash drawer opened.'
+            : 'Receipt printed.'
+        );
+      } else {
+        const errMsg =
+          printRes.data?.error ||
+          printRes.error ||
+          'Automatic print failed.';
+
+        try {
+          const fallback = openHtmlReceiptFallback(response.data, settings);
+          setPrintStatus(
+            fallback.ok
+              ? `${errMsg} Opened browser print dialog.`
+              : `${errMsg} ${fallback.error || 'Use Reprint Receipt.'}`
+          );
+        } catch (fallbackError) {
+          setPrintStatus(
+            `${errMsg} Browser print fallback failed: ${fallbackError.message}`
+          );
+        }
+      }
+    } catch (err) {
+      setPrintStatus(`Automatic print failed: ${err.message || 'Unknown error.'}`);
+
+      try {
+        const fallback = openHtmlReceiptFallback(response.data, settings);
+        if (fallback.ok) {
+          setPrintStatus('Automatic print failed. Opened browser print dialog.');
+        } else {
+          setPrintStatus(
+            `Automatic print failed. ${fallback.error || 'Use Reprint Receipt.'}`
+          );
+        }
+      } catch (fallbackError) {
+        setPrintStatus(`Printing failed: ${fallbackError.message}`);
+      }
+    } finally {
+      setPrinting(false);
+    }
+
+    if (printRes.success && printRes.data?.success) {
+      setPrintStatus(
+        response.data.paymentMethod === 'cash'
+          ? 'Receipt printed. Cash drawer opened.'
+          : 'Receipt printed.'
+      );
+    } else {
+      const errMsg =
+        printRes.data?.error
+        || printRes.error
+        || 'Automatic print failed.';
+      const fallback = openHtmlReceiptFallback(response.data, settings);
+      setPrintStatus(
+        fallback.ok
+          ? `${errMsg} Opened browser print dialog.`
+          : `${errMsg} ${fallback.error || 'Use Reprint Receipt.'}`
+      );
+    }
+    setPrinting(false);
+  };
+
+  function openHtmlReceiptFallback(sale, shopSettings) {
+    const html = buildThermalReceiptHtml({
+      shop: shopSettings || {},
+      sale,
+      paperWidth: shopSettings?.paperWidth || 80,
+      autoPrint: true,
+    });
+    const win = window.open('', '_blank', 'width=360,height=640');
+    if (!win) {
+      return { ok: false, error: 'Pop-up blocked. Allow pop-ups to print the receipt.' };
+    }
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+    return { ok: true };
+  }
+
+  const handlePrintReceipt = async () => {
+   
+  const handlePrintReceipt = async () => {
+    if (!completedSale || printing) return;
+
+    setPrinting(true);
+    setPrintStatus('Printing…');
+
+    try {
+      // Reprint: do not kick the cash drawer again
+      const thermal = await invokeWithAuth('printer:printReceipt', {
+        saleId: completedSale.id,
+        openDrawer: false,
+      });
+
+      if (thermal.success && thermal.data?.success) {
+        setPrintStatus('Receipt reprinted.');
+        return;
+      }
+
+      const errorMessage =
+        thermal.data?.error ||
+        thermal.error ||
+        'Reprint failed.';
+
+      try {
+        const fallback = openHtmlReceiptFallback(completedSale, settings);
+
+        setPrintStatus(
+          fallback.ok
+            ? 'Opened browser print dialog.'
+            : `${errorMessage} ${fallback.error || ''}`
+        );
+      } catch (fallbackError) {
+        setPrintStatus(
+          `${errorMessage} Browser print failed: ${fallbackError.message}`
+        );
+      }
+    } catch (err) {
+      setPrintStatus(`Reprint failed: ${err.message || 'Unknown error.'}`);
+    } finally {
+      setPrinting(false);
+    }
+  };
+
+  };
+
+  const startNewSale = () => {
+    setSuccessOpen(false);
+    setCompletedSale(null);
+    setPrintStatus('');
+    setReceiptSeconds(120);
+    barcodeRef.current?.focus();
+  };
+
+  useEffect(() => {
+    if (!successOpen) return undefined;
+    const timer = window.setInterval(() => {
+      setReceiptSeconds((seconds) => {
+        if (seconds <= 1) {
+          window.clearInterval(timer);
+          startNewSale();
+          return 120;
+        }
+        return seconds - 1;
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [successOpen]);
+
+  const resetReceiptCountdown = () => setReceiptSeconds(120);
+  const saleDiscountActive = saleDiscountType !== 'none' && Number(saleDiscountValue) > 0;
+
+  return (
+    <AppShell title="New Sale" description="Scan barcode, take payment, save the sale.">
+      <div className="grid gap-6 xl:grid-cols-[1.35fr_1fr]">
+        <div className="space-y-4">
+          {!dayOpen && (
+            <Alert variant="destructive" className="rounded-xl">
+              <AlertDescription className="font-semibold">
+                Cash day is not open. Open the day with float cash before selling.{' '}
+                <button type="button" className="underline" onClick={() => navigate('/day-close')}>
+                  Open day
+                </button>
+              </AlertDescription>
+            </Alert>
+          )}
+          {dayOpen && staleDay && (
+            <Alert
+              className={cn(
+                'rounded-xl',
+                staleDayBlocks
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-100'
+                  : 'border-amber-500/30 bg-amber-500/5 text-amber-800 dark:text-amber-200'
+              )}
+            >
+              <AlertDescription className="font-semibold">
+                Yesterday&apos;s cash day is still open.
+                {staleDayBlocks
+                  ? ' Close & print Z, then open today before selling.'
+                  : ' You can still sell, but close the day when you can.'}{' '}
+                <button type="button" className="underline" onClick={() => navigate('/day-close')}>
+                  Go to Day Close
+                </button>
+              </AlertDescription>
+            </Alert>
+          )}
+          {error && (
+            <Alert variant="destructive" className="rounded-xl border-destructive/20 bg-destructive/10">
+              <AlertDescription className="text-destructive font-semibold">{error}</AlertDescription>
+            </Alert>
+          )}
+
+          {maxPct !== null && (
+            <p className="text-xs text-muted-foreground">
+              Your discount limit: up to <span className="font-semibold text-foreground">{maxPct}%</span> of item or bill total.
+              {user?.role === 'admin' ? '' : ' Admins have no limit.'}
+            </p>
+          )}
+
+          <form onSubmit={handleLookup} className="flex gap-3">
+            <div className="relative flex-1">
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-5 w-5 text-muted-foreground" />
+              <input
+                ref={barcodeRef}
+                className={cn(inputClassName, 'pl-12 h-14 text-base border-2 focus:ring-4 placeholder:text-muted-foreground/60')}
+                value={barcode}
+                onChange={(e) => setBarcode(e.target.value)}
+                placeholder="Scan or type barcode, then Enter"
+                autoComplete="off"
+              />
+              <span className="absolute right-4 top-1/2 -translate-y-1/2 px-2 py-1 rounded-lg bg-muted border border-border text-[10px] font-bold text-muted-foreground/80 tracking-widest select-none font-mono">
+                PRESS F1
+              </span>
+            </div>
+            <Button type="submit" className="h-14 px-6 rounded-xl font-bold text-base cursor-pointer">Add</Button>
+            <Button type="button" variant="outline" className="h-14 px-6 rounded-xl font-bold text-base" onClick={() => setCatalogOpen(true)}>
+              Browse
+            </Button>
+          </form>
+
+          <div className="rounded-2xl border border-border/60 bg-card overflow-hidden shadow-sm">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/40 text-muted-foreground border-b border-border/60">
+                  <tr>
+                    <th className="text-left p-4 font-bold text-xs uppercase tracking-wider">Item</th>
+                    <th className="text-left p-4 font-bold text-xs uppercase tracking-wider w-[180px]">Qty</th>
+                    <th className="text-left p-4 font-bold text-xs uppercase tracking-wider">Price</th>
+                    <th className="text-left p-4 font-bold text-xs uppercase tracking-wider min-w-[200px]">Item discount</th>
+                    <th className="text-right p-4 font-bold text-xs uppercase tracking-wider">Total</th>
+                    <th className="p-4 w-[60px]" />
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/40">
+                  {!items.length && (
+                    <tr>
+                      <td colSpan={6} className="p-12 text-center text-muted-foreground font-medium text-base">
+                        No items added. Scan a barcode to start checkout.
+                      </td>
+                    </tr>
+                  )}
+                  {totals.lines.map((item) => {
+                    const lineType = saleDiscountActive ? 'none' : (item.discountType || 'none');
+                    const lineValue = saleDiscountActive ? '' : (item.discountValue || '');
+                    return (
+                      <tr key={item.variantId} className="hover:bg-muted/5 transition-colors">
+                        <td className="p-4 align-middle">
+                          <p className="font-bold text-base text-foreground leading-tight">{item.productName}</p>
+                          <p className="text-xs text-muted-foreground mt-1 font-mono tracking-wide">{item.barcode || item.sku}</p>
+                        </td>
+                        <td className="p-4 align-middle">
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => updateQty(item.variantId, item.quantity - 1)}
+                              className="h-10 w-10 rounded-xl border border-border bg-card flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/60 active:scale-95 transition-all select-none cursor-pointer"
+                            >
+                              <Minus className="h-4 w-4" />
+                            </button>
+                            <input
+                              type="number"
+                              min="1"
+                              className="w-14 h-10 rounded-xl border border-border bg-input text-center font-bold text-base focus:outline-none focus:ring-2 focus:ring-ring"
+                              value={item.quantity}
+                              onChange={(e) => updateQty(item.variantId, e.target.value)}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => updateQty(item.variantId, item.quantity + 1)}
+                              className="h-10 w-10 rounded-xl border border-border bg-card flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/60 active:scale-95 transition-all select-none cursor-pointer"
+                            >
+                              <Plus className="h-4 w-4" />
+                            </button>
+                          </div>
+                        </td>
+                        <td className="p-4 align-middle font-bold text-foreground">{formatMoney(item.unitPrice)}</td>
+                        <td className="p-4 align-middle">
+                          <div className="flex gap-1.5 items-center">
+                            <select
+                              className="h-10 rounded-xl border border-border bg-input text-xs font-semibold px-2 disabled:opacity-50"
+                              disabled={saleDiscountActive}
+                              value={lineType === 'none' ? 'fixed' : lineType}
+                              onChange={(e) =>
+                                handleItemDiscountChange(
+                                  item.variantId,
+                                  e.target.value,
+                                  lineValue || 0
+                                )
+                              }
+                            >
+                              <option value="fixed">Rs.</option>
+                              <option value="percent">%</option>
+                            </select>
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              disabled={saleDiscountActive}
+                              className="w-20 h-10 rounded-xl border border-border bg-input text-sm font-semibold px-2 focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+                              value={lineType === 'none' ? '' : lineValue}
+                              placeholder="0"
+                              onChange={(e) =>
+                                handleItemDiscountChange(
+                                  item.variantId,
+                                  lineType === 'none' ? 'fixed' : lineType,
+                                  e.target.value
+                                )
+                              }
+                            />
+                            {item.discountAmount > 0 && (
+                              <span className="text-[10px] text-muted-foreground whitespace-nowrap">
+                                −{formatMoney(item.discountAmount)}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-4 align-middle text-right font-bold text-base text-foreground">{formatMoney(item.lineTotal)}</td>
+                        <td className="p-4 align-middle text-right">
+                          <button
+                            type="button"
+                            onClick={() => removeItem(item.variantId)}
+                            className="p-2.5 rounded-xl text-destructive hover:bg-destructive/10 active:scale-95 transition-all cursor-pointer"
+                            title="Remove item"
+                          >
+                            <Trash2 className="h-5 w-5" />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-border bg-card p-6 space-y-6 h-fit shadow-md">
+          <div>
+            <h3 className="font-extrabold text-lg text-foreground mb-1">Select Payment</h3>
+            <p className="text-xs text-muted-foreground">Choose customer checkout method</p>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            {[
+              { id: 'cash', label: 'Cash', activeBg: 'bg-emerald-500/15 border-emerald-500 text-emerald-500 font-bold' },
+              { id: 'card', label: 'Card', activeBg: 'bg-violet-500/15 border-violet-500 text-violet-500 font-bold' },
+              { id: 'qr', label: 'QR Pay', activeBg: 'bg-amber-500/15 border-amber-500 text-amber-500 font-bold' },
+            ].map(({ id, label, activeBg }) => {
+              const isActive = paymentMethod === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => {
+                    setPaymentMethod(id);
+                    if (id !== 'cash') {
+                      setTendered('');
+                    }
+                  }}
+                  className={cn(
+                    'h-14 rounded-xl border-2 text-sm font-bold transition-all cursor-pointer shadow-sm active:scale-95',
+                    isActive ? activeBg : 'border-border bg-card text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="space-y-3 rounded-xl border border-border/60 bg-muted/20 p-4">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-bold text-foreground">Bill discount</p>
+              {saleDiscountActive && (
+                <button type="button" className="text-xs font-semibold text-destructive hover:underline" onClick={handleClearSaleDiscount}>
+                  Clear
+                </button>
+              )}
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Applies to the whole bill. Clears any item discounts (only one type at a time).
+            </p>
+            <div className="flex gap-2">
+              <select
+                className="h-11 rounded-xl border border-border bg-input text-sm font-semibold px-2"
+                value={saleDiscDraftType}
+                onChange={(e) => setSaleDiscDraftType(e.target.value)}
+              >
+                <option value="fixed">Rs. off</option>
+                <option value="percent">% off</option>
+              </select>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                className="flex-1 h-11 rounded-xl border border-border bg-input text-sm font-semibold px-3"
+                value={saleDiscDraftValue}
+                onChange={(e) => setSaleDiscDraftValue(e.target.value)}
+                placeholder={saleDiscDraftType === 'percent' ? 'e.g. 5' : 'e.g. 200'}
+              />
+              <Button type="button" variant="outline" className="h-11" onClick={handleApplySaleDiscount}>
+                Apply
+              </Button>
+            </div>
+          </div>
+
+          <div className="p-4 rounded-xl bg-muted/40 border border-border/40 space-y-3 text-sm">
+            <div className="flex justify-between font-semibold">
+              <span className="text-muted-foreground">Subtotal (original)</span>
+              <span className="text-foreground">{formatMoney(totals.subtotal)}</span>
+            </div>
+            <div className="flex justify-between font-semibold">
+              <span className="text-muted-foreground">Discount</span>
+              <span className="text-foreground">{formatMoney(totals.discountTotal)}</span>
+            </div>
+            <div className="flex justify-between font-semibold">
+              <span className="text-muted-foreground">VAT (incl.)</span>
+              <span className="text-foreground">{formatMoney(totals.vatTotal)}</span>
+            </div>
+            <div className="flex justify-between text-lg font-black pt-3 border-t border-border border-dashed">
+              <span className="text-foreground">Grand Total</span>
+              <span className="text-foreground text-xl">{formatMoney(totals.total)}</span>
+            </div>
+            {user?.role === 'admin' && (
+              <div className="flex justify-between text-xs font-semibold pt-1 text-muted-foreground">
+                <span>Est. profit after discount</span>
+                <span>{formatMoney(totals.discountedProfit)}</span>
+              </div>
+            )}
+          </div>
+
+          {paymentMethod === 'cash' && (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center gap-2">
+                <label className="text-sm font-bold text-foreground" htmlFor="tendered">
+                  Cash Tendered
+                </label>
+                <div className="flex items-center gap-3">
+                  {tendered !== '' && (
+                    <button
+                      type="button"
+                      onClick={() => setTendered('')}
+                      className="text-xs font-semibold text-destructive hover:underline cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setTendered(String(totals.total.toFixed(2)))}
+                    className="text-xs font-bold text-primary hover:underline cursor-pointer"
+                  >
+                    Set exact amount
+                  </button>
+                </div>
+              </div>
+
+              <div className="relative">
+                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-bold text-muted-foreground font-mono">Rs.</span>
+                <input
+                  id="tendered"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  className={cn(inputClassName, 'pl-11 text-lg font-black h-12 border-2 focus:ring-4')}
+                  value={tendered}
+                  onChange={(e) => setTendered(e.target.value)}
+                  placeholder={String(totals.total.toFixed(2))}
+                />
+              </div>
+
+              <div className="grid grid-cols-4 gap-2">
+                {[100, 500, 1000, 5000].map((amount) => (
+                  <button
+                    key={amount}
+                    type="button"
+                    onClick={() => {
+                      const currentTendered = Number(tendered || 0);
+                      setTendered(String(currentTendered + amount));
+                    }}
+                    className="h-10 rounded-xl border border-border bg-card hover:bg-muted text-xs font-extrabold text-foreground cursor-pointer transition-all active:scale-95"
+                  >
+                    +{amount}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex justify-between items-center text-sm font-bold pt-1">
+                <span className="text-muted-foreground">Change Due</span>
+                <span className={cn('text-base font-black', change >= 0 ? 'text-emerald-500' : 'text-destructive')}>{formatMoney(change)}</span>
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-3 pt-2">
+            <button
+              type="button"
+              disabled={saving || !items.length || staleDayBlocks || !dayOpen}
+              onClick={handleCompleteSale}
+              className="w-full h-14 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 font-bold text-white shadow-lg shadow-orange-500/20 active:scale-[0.98] transition-all disabled:opacity-50 disabled:pointer-events-none select-none cursor-pointer flex items-center justify-center gap-2"
+            >
+              {saving ? 'Processing...' : 'Complete Checkout'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => navigate(-1)}
+              className="w-full h-12 rounded-xl border border-border bg-card hover:bg-muted font-semibold text-muted-foreground hover:text-foreground transition-all cursor-pointer shadow-sm"
+            >
+              Cancel Sale
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <Dialog open={catalogOpen} onOpenChange={setCatalogOpen}>
+        <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Search Products</DialogTitle>
+            <DialogDescription>
+              Search by name, SKU, barcode, or brand. Only barcode-enabled variants can be added.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <input
+                className={cn(inputClassName, 'pl-10')}
+                value={catalogQuery}
+                onChange={(e) => setCatalogQuery(e.target.value)}
+                placeholder="Search products..."
+              />
+            </div>
+
+            <div className="space-y-2">
+              {!catalogResults.length && (
+                <p className="text-sm text-muted-foreground">No matching barcode-enabled products found.</p>
+              )}
+              {catalogResults.map((variant) => (
+                <button
+                  key={variant.id}
+                  type="button"
+                  onClick={() => addVariantToSale(variant)}
+                  className="w-full text-left rounded-xl border border-border bg-card p-3 hover:bg-muted/40 transition-colors"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="font-semibold truncate">{variant.product?.name || variant.productName || variant.name}</p>
+                      <p className="text-xs text-muted-foreground truncate">
+                        {variant.product?.brand || ''}{variant.product?.brand ? ' · ' : ''}{variant.name || 'Default variant'}
+                      </p>
+                      <p className="text-xs text-muted-foreground font-mono mt-1">
+                        {variant.barcode} · {variant.sku}
+                      </p>
+                    </div>
+                    <div className="text-sm font-bold text-foreground">
+                      {formatMoney(variant.sellingPrice)}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={successOpen} onOpenChange={(open) => { if (!open) startNewSale(); }}>
+        <DialogContent className="max-w-md bg-card border border-border rounded-3xl p-6 shadow-2xl">
+          <DialogHeader className="text-center">
+            <div className="mx-auto w-12 h-12 rounded-full bg-emerald-500/15 flex items-center justify-center mb-2">
+              <span className="text-emerald-500 text-xl font-bold">✓</span>
+            </div>
+            <DialogTitle className="text-2xl font-extrabold text-foreground">Sale Completed</DialogTitle>
+            <DialogDescription className="text-xs font-mono font-bold tracking-widest text-muted-foreground uppercase">
+              Invoice #{completedSale?.invoiceNumber}
+            </DialogDescription>
+          </DialogHeader>
+
+          {completedSale && (
+            <div onClick={resetReceiptCountdown} className="relative my-6 p-5 rounded-2xl bg-muted/30 border border-border/50 space-y-4 font-semibold cursor-pointer">
+              <div className="absolute right-4 top-3 text-xs font-semibold text-amber-600">Starting new sale in 0:{String(receiptSeconds).padStart(2, '0')}...</div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Total Sale</span>
+                <span className="font-extrabold text-foreground text-lg">{formatMoney(completedSale.total)}</span>
+              </div>
+              {completedSale.discountTotal > 0 && (
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Discount applied</span>
+                  <span className="text-foreground">{formatMoney(completedSale.discountTotal)}</span>
+                </div>
+              )}
+              <div className="flex justify-between text-sm items-center">
+                <span className="text-muted-foreground">Payment Method</span>
+                <span className="text-xs uppercase font-extrabold tracking-widest bg-muted border border-border px-2.5 py-1 rounded-lg text-foreground">
+                  {completedSale.paymentMethod}
+                </span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Cash Tendered</span>
+                <span className="text-foreground">{formatMoney(completedSale.amountTendered)}</span>
+              </div>
+              <div className="flex justify-between text-sm pt-2 border-t border-dashed border-border/60">
+                <span className="text-muted-foreground">Change Given</span>
+                <span className="font-black text-emerald-500 text-base">{formatMoney(completedSale.changeGiven)}</span>
+              </div>
+
+              {completedSale.ird?.qrData && (
+                <div className="pt-4 flex flex-col items-center justify-center">
+                  <div className="p-3 bg-white rounded-xl shadow-sm border border-border/40">
+                    <img src={completedSale.ird.qrData} alt="Invoice QR" className="h-32 w-32 object-contain" />
+                  </div>
+                  <span className="text-[10px] text-muted-foreground font-semibold mt-2 tracking-wider">LOCAL INVOICE QR</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {printStatus ? (
+            <p className={`text-center text-xs font-semibold -mt-2 mb-2 ${
+              /fail|error|block/i.test(printStatus) ? 'text-amber-600' : 'text-emerald-600'
+            }`}>
+              {printStatus}
+            </p>
+          ) : null}
+
+          <DialogFooter className="grid grid-cols-2 gap-3 sm:space-x-0">
+            <button
+              type="button"
+              onClick={handlePrintReceipt}
+              disabled={printing}
+              className="h-12 rounded-xl border border-border hover:bg-muted font-bold text-sm text-foreground flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
+            >
+              <Printer className="h-4 w-4" />
+              {printing ? 'Printing…' : 'Reprint Receipt'}
+            </button>
+            <button
+              type="button"
+              onClick={startNewSale}
+              className="h-12 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 font-bold text-sm text-white shadow-md shadow-orange-500/10 flex items-center justify-center cursor-pointer transition-all active:scale-95"
+            >
+              New Sale
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </AppShell>
+  );
+}

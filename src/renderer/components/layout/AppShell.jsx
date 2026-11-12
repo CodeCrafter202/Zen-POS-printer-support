@@ -1,0 +1,233 @@
+import React from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuthStore } from '../../store/authStore';
+import { useThemeStore } from '../../store/themeStore';
+import { Button } from '../ui/button';
+import { LogOut, LayoutDashboard, Users, ShoppingCart, Package, BarChart3, Settings, Sun, Moon, AlertTriangle, Wallet, Truck, Undo2, Receipt, Tag } from 'lucide-react';
+import { cn } from '../../lib/utils';
+import { getDashboardPath, invokeWithAuth, LOW_STOCK_UPDATED_EVENT } from '../../lib/ipc';
+import { useCloseDayReminder } from '../../lib/useCloseDayReminder.js';
+import { hasPermission } from '../../lib/permissions.js';
+
+const FEATURE_NAV = [
+  { path: '/day-close', label: 'Day Open/Close', icon: Wallet, color: 'text-teal-500', permission: 'dayClose' },
+  { path: '/billing', label: 'New Sale', icon: ShoppingCart, color: 'text-emerald-500', permission: null },
+  { path: '/purchases', label: 'Purchases', icon: Truck, color: 'text-cyan-500', permission: 'purchases' },
+  { path: '/products', label: 'Products', icon: Package, color: 'text-violet-500', permission: 'products' },
+  { path: '/labels', label: 'Labels', icon: Tag, color: 'text-fuchsia-500', permission: 'labels' },
+  { path: '/returns', label: 'Returns', icon: Undo2, color: 'text-orange-500', permission: 'returns' },
+  { path: '/expenses', label: 'Expenses', icon: Receipt, color: 'text-lime-600', permission: 'expenses' },
+  { path: '/low-stock', label: 'Low Stock', icon: AlertTriangle, color: 'text-red-500', permission: 'lowStock' },
+  { path: '/reports', label: 'Reports', icon: BarChart3, color: 'text-sky-500', permission: 'reports' },
+];
+
+const ADMIN_ONLY_NAV = [
+  { path: '/staff', label: 'Staff Management', icon: Users, color: 'text-rose-500' },
+  { path: '/settings', label: 'Settings', icon: Settings, color: 'text-slate-500' },
+];
+
+function navItemsForUser(user) {
+  if (!user?.role) return [];
+
+  const dashboardLabel = user.role === 'cashier' ? 'POS Terminal' : 'Dashboard';
+  const items = [
+    {
+      path: getDashboardPath(user.role),
+      label: dashboardLabel,
+      icon: LayoutDashboard,
+      color: 'text-amber-500',
+    },
+  ];
+
+  for (const item of FEATURE_NAV) {
+    if (!item.permission || hasPermission(user, item.permission)) {
+      items.push(item);
+    }
+  }
+
+  if (user.role === 'admin') {
+    items.push(...ADMIN_ONLY_NAV);
+  }
+
+  return items;
+}
+
+const nameToAvatar = (name) => {
+  if (!name) return '?';
+  const parts = name.trim().split(/\s+/);
+  if (parts.length > 1) {
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+  return name.slice(0, 2).toUpperCase();
+};
+
+export default function AppShell({ children, title, description }) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const user = useAuthStore((state) => state.user);
+  const setLogout = useAuthStore((state) => state.setLogout);
+  const { theme, toggleTheme } = useThemeStore();
+
+  const [timeString, setTimeString] = React.useState('');
+  const [profileOpen, setProfileOpen] = React.useState(false);
+  const [lowStockCount, setLowStockCount] = React.useState(0);
+  const showCloseReminder = useCloseDayReminder();
+  const canViewLowStock = hasPermission(user, 'lowStock');
+
+  React.useEffect(() => {
+    const updateClock = () => {
+      const now = new Date();
+      setTimeString(
+        now.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }) +
+        ' | ' +
+        now.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
+      );
+    };
+    updateClock();
+    const timer = setInterval(updateClock, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  React.useEffect(() => {
+    if (!canViewLowStock) {
+      setLowStockCount(0);
+      return undefined;
+    }
+
+    let active = true;
+    const refreshLowStockCount = async () => {
+      try {
+        const response = await invokeWithAuth('inventory:getLowStock');
+        if (active && response.success) setLowStockCount((response.data || []).length);
+      } catch {
+        if (active) setLowStockCount(0);
+      }
+    };
+
+    refreshLowStockCount();
+    window.addEventListener(LOW_STOCK_UPDATED_EVENT, refreshLowStockCount);
+    return () => {
+      active = false;
+      window.removeEventListener(LOW_STOCK_UPDATED_EVENT, refreshLowStockCount);
+    };
+  }, [location.pathname, canViewLowStock]);
+
+  const navItems = navItemsForUser(user);
+
+  const handleLogout = async () => {
+    await setLogout();
+    navigate('/login');
+  };
+
+  return (
+    <div className="h-screen overflow-hidden bg-background text-foreground flex">
+      {/* Sidebar navigation */}
+      <aside className="w-64 h-screen border-r border-border bg-card flex flex-col shrink-0 select-none">
+        <button type="button" onClick={() => navigate(getDashboardPath(user?.role))} className="p-6 border-b border-border/40 flex items-center gap-3 text-left cursor-pointer hover:bg-muted/30">
+          <img src="./logo.png" alt="ZEN" className="h-11 w-11 rounded-xl object-contain shadow-md shadow-orange-500/10" />
+          <div>
+            <h1 className="text-xl font-black tracking-tight bg-gradient-to-r from-amber-400 to-orange-500 bg-clip-text text-transparent">
+              ZEN
+            </h1>
+            <p className="text-[10px] text-muted-foreground uppercase font-bold tracking-widest mt-0.5">Point of Sale</p>
+          </div>
+        </button>
+
+        <nav className="flex-1 min-h-0 overflow-y-auto p-4 space-y-2">
+          {navItems.map(({ path, label, icon: Icon, color }) => {
+            const isActive = location.pathname === path;
+            return (
+              <button
+                key={path}
+                type="button"
+                onClick={() => navigate(path)}
+                className={cn(
+                  'w-full flex items-center gap-3 px-4 py-3.5 rounded-xl text-sm font-semibold transition-all cursor-pointer h-14',
+                  isActive
+                    ? 'bg-primary/10 text-primary border border-primary/20 shadow-sm shadow-primary/5 font-bold'
+                    : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground border border-transparent'
+                )}
+              >
+                <Icon className={cn("h-5 w-5 shrink-0 transition-transform duration-100", color, isActive && "scale-110")} />
+                <span className="flex min-w-0 flex-1 items-center justify-between gap-2"><span>{label}</span>{path === '/low-stock' && lowStockCount > 0 && <span className="rounded-full bg-red-500 px-2 py-0.5 text-[10px] font-bold text-white">{lowStockCount}</span>}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="p-4 border-t border-border/40">
+          <Button variant="outline" className="w-full h-12 rounded-xl font-semibold border-border hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer shadow-sm transition-all" onClick={handleLogout}>
+            <LogOut className="h-4 w-4 mr-2" />
+            Logout
+          </Button>
+        </div>
+      </aside>
+
+      {/* Main content pane */}
+      <main className="flex-1 flex flex-col min-w-0 min-h-0">
+        {showCloseReminder && hasPermission(user, 'dayClose') && (
+          <div
+            role="status"
+            className="shrink-0 border-b border-emerald-500/25 bg-emerald-500/10 px-8 py-2 text-center animate-[closeDayPulse_2.8s_ease-in-out_infinite]"
+          >
+            <p className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">
+              Please close the cash day before midnight
+            </p>
+          </div>
+        )}
+        <header className="border-b border-border bg-card/45 backdrop-blur-md px-8 py-4 flex items-center justify-between">
+          <div className="flex flex-col">
+            <h2 className="text-xl font-bold tracking-tight">{title}</h2>
+            {description && (
+              <p className="text-xs text-muted-foreground mt-0.5">{description}</p>
+            )}
+          </div>
+          
+          {/* Center: Real-time clock */}
+          <div className="hidden lg:flex items-center gap-2 px-4 py-2 rounded-xl bg-muted/40 border border-border/30 text-sm font-semibold font-mono tracking-wide text-muted-foreground select-none">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            {timeString}
+          </div>
+
+          {/* Right: Theme switch & User clerk indicator */}
+          <div className="flex items-center gap-4 select-none">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              className="p-2.5 rounded-xl border border-border bg-card hover:bg-muted text-muted-foreground hover:text-foreground transition-all cursor-pointer shadow-sm active:scale-95"
+              title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+            >
+              {theme === 'dark' ? <Sun className="h-4.5 w-4.5" /> : <Moon className="h-4.5 w-4.5" />}
+            </button>
+
+            <div className="relative flex items-center gap-3 pl-3 border-l border-border/50">
+              <div className="text-right hidden sm:block">
+                <p className="text-sm font-bold text-foreground truncate max-w-[150px]">
+                  {user?.display_name || user?.username}
+                </p>
+                <p className="text-xs text-muted-foreground capitalize font-medium">
+                  {user?.role}
+                </p>
+              </div>
+              <button type="button" onClick={() => setProfileOpen((open) => !open)} aria-expanded={profileOpen} className={`w-10 h-10 rounded-xl flex items-center justify-center font-bold text-sm shadow-sm shrink-0 cursor-pointer ${
+                user?.role === 'admin'
+                  ? 'bg-gradient-to-tr from-rose-500 to-orange-500 text-white'
+                  : 'bg-gradient-to-tr from-sky-500 to-blue-600 text-white'
+              }`}>
+                {nameToAvatar(user?.display_name || user?.username)}
+              </button>
+              {profileOpen && (
+                <div className="absolute right-0 top-12 z-20 w-40 rounded-xl border border-border bg-card p-2 shadow-xl">
+                  <button type="button" onClick={handleLogout} className="w-full rounded-lg px-3 py-2 text-left text-sm font-semibold text-destructive hover:bg-destructive/10">
+                    <LogOut className="mr-2 inline h-4 w-4" /> Logout
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </header>
+        <div className="flex-1 min-h-0 p-8 overflow-y-auto">{children}</div>
+      </main>
+    </div>
+  );
+}
